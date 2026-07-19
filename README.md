@@ -7,16 +7,26 @@ Dropbox…). No server, no subscription, no third-party sync service.
 Update an addon on one machine, it's updated on all of them. Move a unit frame
 on one machine, it's moved on all of them.
 
-## How it works
+## How it works (v1.1)
 
-Your `Interface\AddOns` folder and your `WTF\Account` folder (addon settings,
-UI layout, WeakAuras, keybinds) are moved into a folder your cloud app already
-syncs. A **directory junction** — a filesystem-level folder link the game can't
-tell apart from a real folder — is placed at the original locations. WoW reads
-and writes through the link; your cloud app keeps every PC in step.
+Two layers, each using the safest mechanism for what it protects:
 
-Machine-specific settings (`WTF\Config.wtf` — graphics, sound) are left alone,
-so each PC keeps its own video config.
+- **Addons** (`Interface\AddOns`) move into your cloud-synced folder, and a
+  **directory junction** — a folder link the game can't tell from a real
+  folder — is left in place. Addon installs and updates sync live.
+- **Settings** (`WTF\Account` — addon config, UI layout, WeakAuras, keybinds)
+  **stay in a normal local folder**. A tiny background agent pushes them to
+  the cloud right after WoW closes, and pulls them down when the cloud copy
+  is newer (i.e. you played on your other PC last). WoW itself never depends
+  on the cloud drive being online — if your cloud app is off, you just play
+  with local files and the sync catches up later.
+
+Machine-specific settings (`WTF\Config.wtf` — graphics, sound) are never
+touched, so each PC keeps its own video config.
+
+> **Upgrading from v1.0?** v1.0 linked `WTF\Account` directly into the cloud.
+> Just run the new setup — it detects the old link and converts your settings
+> back to a normal local folder automatically. Nothing is deleted.
 
 ## Quick start
 
@@ -31,9 +41,10 @@ Grab **WoWSyncSetup.exe** from the [latest release](../../releases/latest).
    reads real local files at full speed.
 3. **Every other PC**: install the same cloud client, wait for the folder to
    finish downloading, run the same exe. It backs up that PC's folders and
-   links it to the shared copy.
+   joins it to the shared copy.
 
-Prefer scripts? `Setup-WoWSync.ps1` does exactly the same thing:
+Prefer scripts? `Setup-WoWSync.ps1` does exactly the same thing (keep
+`wowsync-agent.ps1` next to it):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Setup-WoWSync.ps1 -CloudFolder "G:\My Drive\WoW Sync"
@@ -42,28 +53,49 @@ powershell -ExecutionPolicy Bypass -File .\Setup-WoWSync.ps1 -CloudFolder "G:\My
 Works with retail, Classic, and Classic Era — pick the game version in the
 dropdown (or `-Flavor _classic_`) and run once per version.
 
+## The background agent
+
+Installed to `%LOCALAPPDATA%\WoWSync\wowsync-agent.ps1`, started at login via
+a `HKCU\...\Run` entry, ~0% CPU (checks for the game every 15 seconds).
+
+- WoW closes → waits 10 s for SavedVariables to flush → pushes local → cloud.
+  If the push fails (cloud app not running), it retries until it succeeds and
+  **never pulls over unsaved local changes**.
+- Idle and the cloud copy is ≥2 min newer → pulls cloud → local.
+- Never syncs while the game is running; never copies from an empty folder.
+- Log: `%LOCALAPPDATA%\WoWSync\agent.log`
+
 ## Good to know
 
 - **Don't play on two PCs at the same time.** Settings save on logout; the
-  last logout wins, and cloud clients may create conflict copies.
+  last logout wins.
 - **Nothing is deleted.** Originals are kept next to the links as
   `*.pre-sync-backup`. Delete them yourself once you're happy.
 - **SmartScreen:** the exe is unsigned, so Windows may warn on first run —
   *More info → Run anyway*. Or build it yourself (below) — it's one command.
-- **Undo:** close WoW, delete the two links (they're just shortcuts), rename
-  the `.pre-sync-backup` folders back.
+- **If WoW ever loads with no addons:** your cloud app isn't running. Start
+  it and restart the game.
+
+## Uninstall
+
+1. Close WoW. Delete the `Interface\AddOns` link (it's just a shortcut), then
+   copy the `AddOns` folder out of your cloud *WoW Sync* folder back into
+   `Interface\` (or rename `AddOns.pre-sync-backup` back to `AddOns`).
+2. Settings are already a normal local folder — nothing to undo.
+3. Remove the agent: delete the `WoWSyncAgent-*` entry under
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (Task Manager →
+   Startup apps), and delete `%LOCALAPPDATA%\WoWSync`.
 
 ## Building from source
 
 No toolchain needed — the C# compiler ships with Windows:
 
 ```
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe ^
-  /out:WoWSyncSetup.exe /win32manifest:app.manifest ^
-  /r:System.Windows.Forms.dll /r:System.Drawing.dll WoWSyncSetup.cs
+build.cmd
 ```
 
-Or just run `build.cmd`.
+(It embeds `wowsync-agent.ps1` into the exe as a resource, so keep the two
+files together.)
 
 ## License
 

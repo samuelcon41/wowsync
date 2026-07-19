@@ -1,8 +1,25 @@
+// WoW Sync Setup v1.1
+//
+// Two-layer design:
+//   * AddOns  -> directory junction into the cloud folder (live sync, safe:
+//                a broken link is obvious and harmless)
+//   * Settings (WTF\Account) -> stays a REAL local folder. A tiny background
+//                agent pushes it to the cloud when WoW closes and pulls it
+//                when the cloud copy is newer. WoW never depends on the cloud
+//                drive being online.
+//
+// v1.0 linked WTF\Account directly; v1.1 detects that and converts it back.
+//
+// Build: build.cmd (embeds wowsync-agent.ps1 as a resource - keep that file
+// next to this one when compiling).
+
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Management;
+using System.Reflection;
 using System.Security.Principal;
 using System.Threading;
 using System.Windows.Forms;
@@ -31,10 +48,11 @@ namespace WoWSyncSetup
         private Button btnRun;
         private TextBox txtLog;
         private bool autoRun;
+        private string launchedByUser;   // set on an elevated relaunch
 
         public MainForm(string[] args)
         {
-            Text = "WoW Sync Setup";
+            Text = "WoW Sync Setup v1.1";
             Font = new Font("Segoe UI", 9F);
             ClientSize = new Size(640, 470);
             MinimumSize = new Size(560, 420);
@@ -137,6 +155,8 @@ namespace WoWSyncSetup
                     int idx = cmbFlavor.Items.IndexOf(f);
                     if (idx >= 0) cmbFlavor.SelectedIndex = idx;
                 }
+                else if (a.StartsWith("/user=", StringComparison.OrdinalIgnoreCase))
+                    launchedByUser = a.Substring(6).Trim('"');
                 else if (a.Equals("/run", StringComparison.OrdinalIgnoreCase))
                     autoRun = true;
             }
@@ -172,13 +192,15 @@ namespace WoWSyncSetup
                         string p = key.GetValue("InstallPath") as string;
                         if (!string.IsNullOrEmpty(p))
                         {
-                            // InstallPath points at the _retail_ (flavor) folder - we want its parent
+                            // InstallPath usually points AT the flavor folder
+                            // (...\World of Warcraft\_retail_), but not always.
+                            // Only accept a candidate that actually contains a
+                            // flavor folder - otherwise we'd happily return
+                            // "C:\Program Files (x86)".
                             string trimmed = p.TrimEnd('\\', '/');
+                            if (LooksLikeWowRoot(trimmed)) return trimmed;
                             string parent = Path.GetDirectoryName(trimmed);
-                            if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
-                                return parent;
-                            if (Directory.Exists(trimmed))
-                                return trimmed;
+                            if (LooksLikeWowRoot(parent)) return parent;
                         }
                     }
                 }
@@ -193,8 +215,21 @@ namespace WoWSyncSetup
                 @"C:\Games\World of Warcraft"
             };
             foreach (string d in defaults)
+                if (LooksLikeWowRoot(d)) return d;
+            foreach (string d in defaults)
                 if (Directory.Exists(d)) return d;
             return "";
+        }
+
+        // A WoW root is a folder that directly contains at least one client
+        // (flavor) folder.
+        private static bool LooksLikeWowRoot(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return false;
+            string[] flavors = new string[] { "_retail_", "_classic_", "_classic_era_", "_anniversary_", "_ptr_", "_beta_" };
+            foreach (string f in flavors)
+                if (Directory.Exists(Path.Combine(path, f))) return true;
+            return false;
         }
 
         private void BrowseCloud_Click(object sender, EventArgs e)
@@ -227,8 +262,8 @@ namespace WoWSyncSetup
 
         private void Run_Click(object sender, EventArgs e)
         {
-            string cloud = txtCloud.Text.Trim();
-            string wow = txtWow.Text.Trim();
+            string cloud = txtCloud.Text.Trim().TrimEnd('\\');
+            string wow = txtWow.Text.Trim().TrimEnd('\\');
             string flavor = cmbFlavor.SelectedItem.ToString();
 
             if (cloud.Length == 0 || wow.Length == 0)
@@ -245,7 +280,12 @@ namespace WoWSyncSetup
                 {
                     ProcessStartInfo psi = new ProcessStartInfo();
                     psi.FileName = Application.ExecutablePath;
-                    psi.Arguments = string.Format("\"/cloud={0}\" \"/wow={1}\" /flavor={2} /run", cloud, wow, flavor);
+                    // Pass the current user's name through: if UAC is satisfied by a
+                    // DIFFERENT admin account, the elevated run would otherwise install
+                    // the background agent into that account's profile, where it would
+                    // never run for this user.
+                    psi.Arguments = string.Format("\"/cloud={0}\" \"/wow={1}\" /flavor={2} \"/user={3}\" /run",
+                        cloud, wow, flavor, Environment.UserName);
                     psi.UseShellExecute = true;
                     psi.Verb = "runas";
                     Process.Start(psi);
@@ -279,12 +319,16 @@ namespace WoWSyncSetup
             txtLog.AppendText(msg + "\r\n");
         }
 
+        // ------------------------------------------------------------------
+        //  Setup logic
+        // ------------------------------------------------------------------
+
         private void DoSetup(string cloudFolder, string wowPath, string flavor)
         {
             Log("");
             Log("=== Starting setup (" + flavor + ") ===");
 
-            if (Process.GetProcessesByName("Wow").Length > 0 || Process.GetProcessesByName("WowClassic").Length > 0)
+            if (WowRunning())
             {
                 Log("ERROR: World of Warcraft is running. Close the game completely (Battle.net can stay open), then try again.");
                 return;
@@ -298,106 +342,449 @@ namespace WoWSyncSetup
             }
 
             string cloudRoot = Path.Combine(cloudFolder, flavor);
-            Directory.CreateDirectory(cloudRoot);
-
-            string[][] pairs = new string[][]
+            try { Directory.CreateDirectory(cloudRoot); }
+            catch (Exception ex)
             {
-                new string[] { Path.Combine(flavorPath, @"Interface\AddOns"), Path.Combine(cloudRoot, "AddOns"), "AddOns" },
-                new string[] { Path.Combine(flavorPath, @"WTF\Account"), Path.Combine(cloudRoot, "WTF-Account"), "Settings (WTF\\Account)" }
-            };
+                Log("ERROR: Can't create '" + cloudRoot + "' - is your cloud drive running? (" + ex.Message + ")");
+                return;
+            }
 
-            string cloudAddons = pairs[0][1];
-            bool cloudSeeded = Directory.Exists(cloudAddons) && Directory.GetFileSystemEntries(cloudAddons).Length > 0;
-            if (cloudSeeded)
-                Log("Cloud folder already has addons in it - linking this PC to the existing cloud copy.");
+            // Stop any agent for this game version FIRST: a running agent could
+            // push or pull underneath the reconciliation below and race it.
+            string localAcct = Path.Combine(flavorPath, @"WTF\Account");
+            KillAgents(localAcct);
+
+            bool addonsOk = SetupAddons(flavorPath, cloudRoot);
+            bool settingsOk = SetupSettings(flavorPath, cloudRoot, flavor);
+            bool agentOk = false;
+            if (settingsOk)
+                agentOk = InstallAgent(Path.Combine(cloudRoot, "WTF-Account"), localAcct, flavor);
+
+            Log("");
+            if (addonsOk && settingsOk && agentOk)
+                Log("=== Done! Addons sync live; settings sync automatically whenever WoW closes. ===");
             else
-                Log("Cloud folder is empty - this PC's addons and settings will become the master copy.");
+                Log("=== Finished with problems - see messages above. Nothing was deleted. ===");
+            Log("");
+            Log("Reminders:");
+            Log(" 1. In your cloud app, mark '" + cloudFolder + "' as 'Available offline' (Google Drive)");
+            Log("    or 'Always keep on this device' (OneDrive) so the game loads at full speed.");
+            Log(" 2. On your other PC(s): install the same cloud app, wait for the folder to");
+            Log("    finish downloading, then run this same program there.");
+            Log(" 3. Don't play WoW on two PCs at the same time.");
+        }
 
-            foreach (string[] pair in pairs)
+        private bool SetupAddons(string flavorPath, string cloudRoot)
+        {
+            string game = Path.Combine(flavorPath, @"Interface\AddOns");
+            string cloud = Path.Combine(cloudRoot, "AddOns");
+            Log("");
+            Log(">>> AddOns");
+
+            if (Directory.Exists(game) && IsReparse(game))
             {
-                string game = pair[0];
-                string cloud = pair[1];
-                string label = pair[2];
-                Log("");
-                Log(">>> " + label);
-
-                if (Directory.Exists(game) &&
-                    (File.GetAttributes(game) & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)
+                // Already a link - but is it OUR link? A link to a different
+                // cloud folder would leave this PC silently out of the sync.
+                string target = ResolveLinkTarget(game);
+                if (target != null && !target.Equals(cloud, StringComparison.OrdinalIgnoreCase))
                 {
-                    Log("    Already linked - skipping.");
-                    continue;
+                    Log("WARNING: AddOns is already linked, but to a different folder:");
+                    Log("           " + target);
+                    Log("         Expected: " + cloud);
+                    Log("         Leaving it alone. Delete that link and re-run if you want to switch.");
+                    return false;
                 }
+                Log("    Already linked - skipping.");
+                return true;
+            }
 
-                if (!cloudSeeded)
-                {
-                    if (!Directory.Exists(game))
-                    {
-                        Log("ERROR: '" + game + "' doesn't exist, so there is nothing to copy. Run the game once first, or seed from your main PC.");
-                        return;
-                    }
-                    Log("    Copying to cloud (this can take a few minutes)...");
-                    int code = RunHidden("robocopy",
-                        string.Format("\"{0}\" \"{1}\" /E /MT:16 /R:2 /W:2 /NFL /NDL /NJH /NP", game, cloud));
-                    if (code >= 8) { Log("ERROR: Copy failed (robocopy code " + code + ")."); return; }
-                    Log("    Copy done.");
-                }
-                else if (!Directory.Exists(cloud))
-                {
-                    Log("ERROR: Cloud copy '" + cloud + "' not found. Wait for your cloud app to finish downloading, then try again.");
-                    return;
-                }
+            bool cloudSeeded = Directory.Exists(cloud) && Directory.GetFileSystemEntries(cloud).Length > 0;
 
-                if (Directory.Exists(game))
+            if (!cloudSeeded)
+            {
+                if (!Directory.Exists(game) || Directory.GetFileSystemEntries(game).Length == 0)
                 {
-                    string backup = game + ".pre-sync-backup";
-                    if (Directory.Exists(backup))
-                        backup = backup + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
-                    Directory.Move(game, backup);
-                    Log("    Your old folder was kept as: " + backup);
+                    Log("ERROR: No addons found locally and none in the cloud. Install some addons first, or run this on your main PC first.");
+                    return false;
+                }
+                Log("    Cloud is empty - copying this PC's addons up (can take a few minutes)...");
+                if (!Robo(game, cloud, false, "addons copy to cloud")) return false;
+            }
+
+            // Keep the original folder as a backup (rename can transiently fail
+            // if something holds a handle on it - retry a few times).
+            if (Directory.Exists(game))
+            {
+                string backup = UniqueBackupPath(game);
+                bool renamed = false;
+                for (int i = 0; i < 5; i++)
+                {
+                    try { Directory.Move(game, backup); renamed = true; break; }
+                    catch (IOException) { Thread.Sleep(3000); }
+                    catch (UnauthorizedAccessException) { Thread.Sleep(3000); }
+                }
+                if (!renamed)
+                {
+                    Log("ERROR: Windows is holding the AddOns folder open and won't let me rename it.");
+                    Log("       Reboot and run this program again - that clears it.");
+                    return false;
+                }
+                Log("    Your old AddOns folder was kept as: " + backup);
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(game));
+            }
+
+            int linkCode = RunHidden("cmd.exe", string.Format("/c mklink /J \"{0}\" \"{1}\"", game, cloud));
+            if (linkCode != 0)
+                linkCode = RunHidden("cmd.exe", string.Format("/c mklink /D \"{0}\" \"{1}\"", game, cloud));
+            if (linkCode != 0)
+            {
+                Log("ERROR: Couldn't create the AddOns link. Try running this program as administrator.");
+                return false;
+            }
+            Log("    Linked: " + game);
+            Log("        -> " + cloud);
+
+            int count = FileCount(game);
+            if (count == 0 && cloudSeeded)
+                Log("WARNING: Link works but no files visible yet - your cloud app may still be downloading.");
+            else
+                Log("    Verified: " + count + " addon files visible to the game.");
+            return true;
+        }
+
+        private bool SetupSettings(string flavorPath, string cloudRoot, string flavor)
+        {
+            string game = Path.Combine(flavorPath, @"WTF\Account");
+            string cloud = Path.Combine(cloudRoot, "WTF-Account");
+            Log("");
+            Log(">>> Settings (WTF\\Account)");
+
+            // v1.0 migration: settings used to be a junction. Convert back to a
+            // real local folder so WoW never depends on the cloud drive.
+            // Check the restore source FIRST - removing the link before knowing
+            // we can restore would leave the user with no settings folder.
+            if (Directory.Exists(game) && IsReparse(game))
+            {
+                Log("    Found a settings link from WoW Sync v1.0 - converting back to a normal local folder...");
+                if (FileCount(cloud) == 0)
+                {
+                    Log("ERROR: That link points at a cloud folder I can't read right now, so there is");
+                    Log("       nothing to restore from. Make sure your cloud app is running and the");
+                    Log("       folder has finished downloading, then run this again.");
+                    Log("       (Your settings are NOT lost - they live in the cloud folder.)");
+                    return false;
+                }
+                // Copy the data out BEFORE touching the link.
+                string staging = game + ".restoring";
+                if (Directory.Exists(staging)) { try { Directory.Delete(staging, true); } catch { } }
+                if (!Robo(cloud, staging, false, "settings restore staging")) return false;
+                if (FileCount(staging) == 0)
+                {
+                    Log("ERROR: Restore copy came out empty - stopping before changing anything.");
+                    return false;
+                }
+                int rc = RunHidden("cmd.exe", string.Format("/c rmdir \"{0}\"", game)); // removes ONLY the link
+                if (rc != 0 || Directory.Exists(game))
+                {
+                    Log("ERROR: Couldn't remove the old settings link. Reboot and run this program again.");
+                    Log("       (Nothing was changed - your settings are safe in the cloud folder.)");
+                    return false;
+                }
+                Directory.Move(staging, game);
+                Log("    Restored " + FileCount(game) + " settings files to a normal local folder.");
+                MarkJoined(flavor);   // this PC is now part of an established sync
+            }
+
+            bool cloudHas = FileCount(cloud) > 0;
+            bool localHas = FileCount(game) > 0;
+
+            if (!cloudHas && !localHas)
+            {
+                Log("WARNING: No settings found locally or in the cloud. Log into the game once, then run this again.");
+                Log("         (Addons are still set up - only settings sync needs another pass.)");
+                return false;
+            }
+
+            if (!cloudHas)
+            {
+                Log("    Cloud is empty - this PC becomes the master copy.");
+                if (!Robo(game, cloud, false, "settings copy to cloud")) return false;
+                Log("    Seeded cloud with " + FileCount(cloud) + " settings files.");
+            }
+            else if (!localHas)
+            {
+                Log("    No local settings - downloading the cloud copy...");
+                if (!Robo(cloud, game, false, "settings download")) return false;
+                Log("    Downloaded " + FileCount(game) + " settings files.");
+            }
+            else
+            {
+                // Both sides have settings. Which one wins depends on whether
+                // this PC has ever been part of this sync before.
+                //
+                // NEVER use "newest wins" for a PC joining an existing sync:
+                // a fresh WoW install that has been logged into once has
+                // BRAND NEW default settings, which would look "newer" than
+                // the master copy and mirror right over it - wiping the real
+                // configuration on every machine.
+                bool joinedBefore = HasJoined(flavor);
+
+                if (!joinedBefore)
+                {
+                    Log("    This PC hasn't synced before and the cloud already has settings,");
+                    Log("    so the cloud copy wins (it's the established master).");
+                    string backup = UniqueBackupPath(game);
+                    if (!Robo(game, backup, false, "settings backup")) return false;
+                    Log("    This PC's old settings were kept as: " + backup);
+                    if (!Robo(cloud, game, true, "settings download")) return false;
                 }
                 else
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(game));
-                }
-
-                int linkCode = RunHidden("cmd.exe", string.Format("/c mklink /J \"{0}\" \"{1}\"", game, cloud));
-                if (linkCode != 0)
-                    linkCode = RunHidden("cmd.exe", string.Format("/c mklink /D \"{0}\" \"{1}\"", game, cloud));
-                if (linkCode != 0)
-                {
-                    Log("ERROR: Couldn't create the link. Try running this program as administrator (right-click -> Run as administrator).");
-                    return;
-                }
-                Log("    Linked: " + game);
-                Log("        -> " + cloud);
-
-                try
-                {
-                    int count = Directory.GetFiles(game, "*", SearchOption.AllDirectories).Length;
-                    if (count == 0 && cloudSeeded)
+                    DateTime localNewest = NewestWriteUtc(game);
+                    DateTime cloudNewest = NewestWriteUtc(cloud);
+                    if (cloudNewest > localNewest.AddMinutes(2))
                     {
-                        Log("WARNING: The link works but no files are visible yet - your cloud app may still be downloading.");
+                        Log("    Cloud settings are newer than this PC's - using the cloud copy.");
+                        string backup = UniqueBackupPath(game);
+                        if (!Robo(game, backup, false, "settings backup")) return false;
+                        Log("    This PC's old settings were kept as: " + backup);
+                        if (!Robo(cloud, game, true, "settings download")) return false;
                     }
                     else
                     {
-                        Log("    Verified: " + count + " files visible to the game.");
+                        // Local wins - but keep a copy of what the cloud had,
+                        // in case the other PC had settings only it knew about.
+                        Log("    This PC's settings are current - pushing them to the cloud.");
+                        string cloudBackup = cloud + ".replaced-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                        if (!Robo(cloud, cloudBackup, false, "cloud settings backup")) return false;
+                        Log("    Previous cloud copy kept as: " + Path.GetFileName(cloudBackup));
+                        if (!Robo(game, cloud, true, "settings push")) return false;
                     }
-                }
-                catch (Exception ex)
-                {
-                    Log("    (Couldn't count files: " + ex.Message + ")");
                 }
             }
 
+            MarkJoined(flavor);
+            Log("    Settings stay in a normal local folder - the background agent keeps them synced.");
+            return true;
+        }
+
+        // "Has this PC already joined the sync for this game version?" Used to
+        // stop a newly-joining PC from mirroring its default settings over an
+        // established master copy.
+        private static string JoinMarkerPath(string flavor)
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WoWSync");
+            return Path.Combine(dir, "joined-" + flavor.Trim('_') + ".marker");
+        }
+
+        private static bool HasJoined(string flavor)
+        {
+            try { return File.Exists(JoinMarkerPath(flavor)); }
+            catch { return false; }
+        }
+
+        private static void MarkJoined(string flavor)
+        {
+            try
+            {
+                string p = JoinMarkerPath(flavor);
+                Directory.CreateDirectory(Path.GetDirectoryName(p));
+                File.WriteAllText(p, DateTime.Now.ToString("u"));
+            }
+            catch { }
+        }
+
+        private bool InstallAgent(string cloudAcct, string localAcct, string flavor)
+        {
             Log("");
-            Log("=== Done! ===");
-            Log("Two things to remember:");
-            Log(" 1. In your cloud app, mark the sync folder 'Available offline' (Google Drive) or");
-            Log("    'Always keep on this device' (OneDrive) so the game loads at full speed.");
-            Log(" 2. Don't play WoW on two PCs at the same time - settings save on logout, last one wins.");
-            Log("");
-            Log("On your other PC: install the same cloud app, wait for the folder to download,");
-            Log("then run this same program there.");
+            Log(">>> Background sync agent");
+
+            // If UAC was satisfied by a different account, the agent would land
+            // in that account's profile and never run for the actual player.
+            if (!string.IsNullOrEmpty(launchedByUser) &&
+                !launchedByUser.Equals(Environment.UserName, StringComparison.OrdinalIgnoreCase))
+            {
+                Log("WARNING: This program was elevated as '" + Environment.UserName + "', but you are");
+                Log("         signed in as '" + launchedByUser + "'. The background settings agent can only");
+                Log("         be installed for the account that plays the game.");
+                Log("         Addons are set up and syncing. To finish settings sync, sign in as");
+                Log("         '" + launchedByUser + "' with administrator rights and run this again.");
+                return false;
+            }
+
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WoWSync");
+            Directory.CreateDirectory(dir);
+            string script = Path.Combine(dir, "wowsync-agent.ps1");
+
+            // The agent script is embedded in this exe at build time.
+            Stream res = Assembly.GetExecutingAssembly().GetManifestResourceStream("wowsync-agent.ps1");
+            if (res == null)
+            {
+                Log("ERROR: agent script resource missing from this build.");
+                return false;
+            }
+            using (StreamReader r = new StreamReader(res))
+            {
+                File.WriteAllText(script, r.ReadToEnd());
+            }
+
+            string agentArgs = string.Format(
+                "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{0}\" -CloudSettings \"{1}\" -LocalSettings \"{2}\"",
+                script, cloudAcct, localAcct);
+
+            // Start at every login.
+            string runName = "WoWSyncAgent-" + flavor.Trim('_');
+            using (RegistryKey run = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"))
+            {
+                run.SetValue(runName, "powershell.exe " + agentArgs);
+            }
+
+            // Replace any agent already running for this game version.
+            KillAgents(localAcct);
+
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = "powershell.exe";
+            psi.Arguments = agentArgs;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            Process.Start(psi);
+
+            Log("    Agent installed and running (auto-starts at login).");
+            Log("    Log files: " + Path.Combine(dir, "agent-*.log"));
+            return true;
+        }
+
+        private void KillAgents(string localAcct)
+        {
+            try
+            {
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'powershell.exe'"))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        string cmd = mo["CommandLine"] as string;
+                        if (cmd == null) continue;
+                        // Require the script to be the -File target. A bare
+                        // "contains wowsync-agent" test would also match any
+                        // console that merely mentions it - killing a user's shell.
+                        if (cmd.IndexOf("wowsync-agent.ps1", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        if (cmd.IndexOf("-File", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        // Kill agents for THIS game version only. Early agents had no
+                        // -LocalSettings argument at all; those are ours too. Agents for
+                        // another flavor must keep running.
+                        if (cmd.IndexOf("-LocalSettings", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            cmd.IndexOf(localAcct, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        if (Convert.ToInt32(mo["ProcessId"]) == Process.GetCurrentProcess().Id) continue;
+                        try { Process.GetProcessById(Convert.ToInt32(mo["ProcessId"])).Kill(); }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // ------------------------------------------------------------------
+        //  Helpers
+        // ------------------------------------------------------------------
+
+        private static bool WowRunning()
+        {
+            string[] names = new string[] { "Wow", "WowClassic", "WowT", "WowB" };
+            foreach (string n in names)
+                if (Process.GetProcessesByName(n).Length > 0) return true;
+            return false;
+        }
+
+        private static bool IsReparse(string path)
+        {
+            try { return (File.GetAttributes(path) & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint; }
+            catch { return false; }
+        }
+
+        // Where does an existing junction/symlink actually point? Parsed from
+        // `dir` output, which is available on every supported Windows without
+        // P/Invoke: "AddOns [C:\target\path]".
+        private static string ResolveLinkTarget(string linkPath)
+        {
+            try
+            {
+                string parent = Path.GetDirectoryName(linkPath);
+                string name = Path.GetFileName(linkPath);
+                using (Process p = new Process())
+                {
+                    p.StartInfo.FileName = "cmd.exe";
+                    p.StartInfo.Arguments = string.Format("/c dir /al \"{0}\"", parent);
+                    p.StartInfo.UseShellExecute = false;
+                    p.StartInfo.RedirectStandardOutput = true;
+                    p.StartInfo.CreateNoWindow = true;
+                    p.Start();
+                    string output = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit();
+
+                    foreach (string line in output.Split('\n'))
+                    {
+                        if (line.IndexOf(name, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        int open = line.LastIndexOf('[');
+                        int close = line.LastIndexOf(']');
+                        if (open >= 0 && close > open)
+                            return line.Substring(open + 1, close - open - 1).Trim().TrimEnd('\\');
+                    }
+                }
+            }
+            catch { }
+            return null;   // unknown - caller treats this as "don't block"
+        }
+
+        private static int FileCount(string path)
+        {
+            try
+            {
+                if (!Directory.Exists(path)) return 0;
+                return Directory.GetFiles(path, "*", SearchOption.AllDirectories).Length;
+            }
+            catch { return 0; }
+        }
+
+        private static DateTime NewestWriteUtc(string path)
+        {
+            DateTime newest = DateTime.MinValue;
+            try
+            {
+                foreach (string f in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    DateTime t = File.GetLastWriteTimeUtc(f);
+                    if (t > newest) newest = t;
+                }
+            }
+            catch { }
+            return newest;
+        }
+
+        private static string UniqueBackupPath(string folder)
+        {
+            string backup = folder + ".pre-sync-backup";
+            if (Directory.Exists(backup))
+                backup = backup + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            return backup;
+        }
+
+        private bool Robo(string src, string dst, bool mirror, string label)
+        {
+            try { Directory.CreateDirectory(dst); }
+            catch (Exception ex) { Log("ERROR: " + label + " - can't create '" + dst + "' (" + ex.Message + ")"); return false; }
+            string flags = mirror ? "/MIR" : "/E";
+            int code = RunHidden("robocopy",
+                string.Format("\"{0}\" \"{1}\" {2} /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NP", src, dst, flags));
+            if (code >= 8)
+            {
+                Log("ERROR: " + label + " failed (robocopy code " + code + ").");
+                return false;
+            }
+            return true;
         }
 
         private static int RunHidden(string file, string arguments)
