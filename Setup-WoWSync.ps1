@@ -130,6 +130,38 @@ if ($addonsItem -and ($addonsItem.Attributes -band [IO.FileAttributes]::ReparseP
     Write-Host "    Verified: $(FileCount $gameAddons) addon files visible to the game."
 }
 
+# Cloud clients keep files "online-only" by default: the name exists but the
+# contents aren't on disk until something opens them. WoW reading addons through
+# the link would then see missing/partial files. Windows flags such files with
+# recall attributes - check for them and say so plainly, because the symptom
+# (missing addons, Lua errors) looks like a broken install rather than an
+# unfinished download.
+$placeholders = 0
+$checkedFiles = 0
+try {
+    foreach ($f in (Get-ChildItem $cloudAddons -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 5000)) {
+        $a = [int]$f.Attributes
+        # RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS | OFFLINE
+        if (($a -band 0x00040000) -or ($a -band 0x00400000) -or ($a -band 0x00001000)) { $placeholders++ }
+        $checkedFiles++
+    }
+} catch { $checkedFiles = 0 }
+
+if ($checkedFiles -gt 0 -and $placeholders -eq 0) {
+    Write-Host "    Addon files are stored on this PC (not online-only) - good." -ForegroundColor Green
+} elseif ($placeholders -gt 0) {
+    Write-Host ""
+    Write-Host "*** ACTION NEEDED BEFORE YOU START WOW ***" -ForegroundColor Red
+    Write-Host "    $placeholders of the $checkedFiles addon files checked are still ONLINE-ONLY -"
+    Write-Host "    your cloud app hasn't downloaded them to this PC yet."
+    Write-Host "    If you launch WoW now, addons will be missing or throw Lua errors."
+    Write-Host ""
+    Write-Host "    Fix: right-click your WoW Sync folder ->"
+    Write-Host "         'Offline access' -> 'Available offline'  (Google Drive)"
+    Write-Host "         'Always keep on this device'             (OneDrive)"
+    Write-Host "    Wait until the folder stops showing cloud icons, then start the game."
+}
+
 # --- Settings: real local folder + reconcile ---------------------------------
 Write-Host ""
 Write-Host ">>> Settings (WTF\Account)" -ForegroundColor Yellow
@@ -239,7 +271,18 @@ Write-Host "    Agent installed and running (auto-starts at login)." -Foreground
 Write-Host "    Log files: $agentDir\agent-*.log"
 
 Write-Host ""
-Write-Host "Done! Reminders:" -ForegroundColor Green
-Write-Host " 1. Mark '$CloudFolder' as 'Available offline' / 'Always keep on this device' in your cloud app."
-Write-Host " 2. On your other PC(s): install your cloud client, wait for the folder to download, then run this same script there."
-Write-Host " 3. Don't play WoW on two PCs at the same time."
+Write-Host "Done!" -ForegroundColor Green
+Write-Host ""
+Write-Host "IMPORTANT - do this now, before you start WoW:" -ForegroundColor Yellow
+Write-Host "  Right-click '$CloudFolder'"
+Write-Host "  -> Offline access -> Available offline   (Google Drive)"
+Write-Host "  -> Always keep on this device            (OneDrive)"
+Write-Host "  Then wait until every item shows the 'on this device' icon rather than a"
+Write-Host "  cloud icon. Your addons are read through a link into that folder, so if the"
+Write-Host "  download hasn't finished, WoW will start with addons missing or Lua errors."
+Write-Host "  (Nothing is broken if that happens - close WoW, let it finish, start again.)"
+Write-Host ""
+Write-Host "Also:"
+Write-Host "  - On your other PC(s): install your cloud client, mark the folder available"
+Write-Host "    offline, let it finish downloading, THEN run this script there."
+Write-Host "  - Don't play WoW on two PCs at the same time."

@@ -366,12 +366,19 @@ namespace WoWSyncSetup
             else
                 Log("=== Finished with problems - see messages above. Nothing was deleted. ===");
             Log("");
-            Log("Reminders:");
-            Log(" 1. In your cloud app, mark '" + cloudFolder + "' as 'Available offline' (Google Drive)");
-            Log("    or 'Always keep on this device' (OneDrive) so the game loads at full speed.");
-            Log(" 2. On your other PC(s): install the same cloud app, wait for the folder to");
-            Log("    finish downloading, then run this same program there.");
-            Log(" 3. Don't play WoW on two PCs at the same time.");
+            Log("IMPORTANT - do this now, before you start WoW:");
+            Log("  Right-click '" + cloudFolder + "'");
+            Log("  -> Offline access -> Available offline   (Google Drive)");
+            Log("  -> Always keep on this device            (OneDrive)");
+            Log("  Then wait until every item shows the 'on this device' icon rather than a");
+            Log("  cloud icon. Your addons are read through a link into that folder, so if the");
+            Log("  download hasn't finished, WoW will start with addons missing or Lua errors.");
+            Log("  (Nothing is broken if that happens - close WoW, let it finish, start again.)");
+            Log("");
+            Log("Also:");
+            Log("  - On your other PC(s): install the same cloud app, mark the folder available");
+            Log("    offline, let it finish downloading, THEN run this program there.");
+            Log("  - Don't play WoW on two PCs at the same time.");
         }
 
         private bool SetupAddons(string flavorPath, string cloudRoot)
@@ -452,7 +459,52 @@ namespace WoWSyncSetup
                 Log("WARNING: Link works but no files visible yet - your cloud app may still be downloading.");
             else
                 Log("    Verified: " + count + " addon files visible to the game.");
+
+            WarnIfNotOffline(cloud);
             return true;
+        }
+
+        // Cloud clients keep files "online-only" by default: the name exists but
+        // the contents aren't on disk until something opens them. WoW reading
+        // addons through the link would then see missing/partial files. Windows
+        // flags such files with recall attributes - check for them and say so
+        // plainly, because the symptom (missing addons, Lua errors) looks like
+        // a broken install rather than an unfinished download.
+        private void WarnIfNotOffline(string cloudPath)
+        {
+            const FileAttributes RecallOnOpen = (FileAttributes)0x00040000;
+            const FileAttributes RecallOnDataAccess = (FileAttributes)0x00400000;
+
+            int placeholders = 0, checkedFiles = 0;
+            try
+            {
+                foreach (string f in Directory.GetFiles(cloudPath, "*", SearchOption.AllDirectories))
+                {
+                    FileAttributes a = File.GetAttributes(f);
+                    if ((a & RecallOnOpen) != 0 || (a & RecallOnDataAccess) != 0 || (a & FileAttributes.Offline) != 0)
+                        placeholders++;
+                    checkedFiles++;
+                    if (checkedFiles >= 5000) break;   // a sample is enough to tell
+                }
+            }
+            catch { return; }   // can't tell - stay quiet rather than cry wolf
+
+            if (placeholders == 0)
+            {
+                Log("    Addon files are stored on this PC (not online-only) - good.");
+                return;
+            }
+
+            Log("");
+            Log("*** ACTION NEEDED BEFORE YOU START WOW ***");
+            Log("    " + placeholders + " of the " + checkedFiles + " addon files checked are still ONLINE-ONLY -");
+            Log("    your cloud app hasn't downloaded them to this PC yet.");
+            Log("    If you launch WoW now, addons will be missing or throw Lua errors.");
+            Log("");
+            Log("    Fix: right-click your WoW Sync folder ->");
+            Log("         'Offline access' -> 'Available offline'  (Google Drive)");
+            Log("         'Always keep on this device'             (OneDrive)");
+            Log("    Wait until the folder stops showing cloud icons, then start the game.");
         }
 
         private bool SetupSettings(string flavorPath, string cloudRoot, string flavor)

@@ -39,9 +39,28 @@ Grab **WoWSyncSetup.exe** from the [latest release](../../releases/latest).
 2. In your cloud app, mark the new *WoW Sync* folder **"Available offline"**
    (Google Drive) / **"Always keep on this device"** (OneDrive) so the game
    reads real local files at full speed.
-3. **Every other PC**: install the same cloud client, wait for the folder to
-   finish downloading, run the same exe. It backs up that PC's folders and
-   joins it to the shared copy.
+3. **Every other PC**: install the same cloud client, then — **before running
+   setup and before launching WoW** — mark the *WoW Sync* folder **"Available
+   offline"** / **"Always keep on this device"** and wait for it to finish
+   downloading. Then run the same exe. It backs up that PC's folders and joins
+   it to the shared copy.
+
+> ### ⚠️ On the second PC: make the folder available offline *before* you start WoW
+>
+> Google Drive and OneDrive normally keep files "online-only" — the names are
+> there, but the contents are not on disk until something opens them. Your
+> addons are read through a folder link into that folder, so if you launch WoW
+> before the download has finished, **the game sees missing or half-written
+> addon files**. Typical symptoms: addons missing from the list, a wall of Lua
+> errors, or a UI that loads with default Blizzard frames.
+>
+> Nothing is corrupted when this happens — the files simply weren't there yet.
+> Close WoW, let the folder finish downloading, and start the game again.
+>
+> To do it: right-click the *WoW Sync* folder →
+> **Offline access → Available offline** (Google Drive), or
+> **Always keep on this device** (OneDrive). Wait for every item to show the
+> solid green/check "on this device" icon, not a cloud icon.
 
 Prefer scripts? `Setup-WoWSync.ps1` does exactly the same thing (keep
 `wowsync-agent.ps1` next to it):
