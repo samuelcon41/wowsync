@@ -1,5 +1,7 @@
 # WoW Sync
 
+> **Status, 2026-10-28: retired.** The author stopped using WoW Sync on their own PCs on 2026-08-25. On those PCs, Windows 11 24H2 blocked directory junctions into Google Drive for desktop's virtual drive, and Drive's mirror mode moved `G:\` to `C:\Users\<you>\My Drive`, which breaks the junction layer described below. The code is unchanged since v1.1.1 and is not being updated.
+
 Keep your World of Warcraft **addons _and_ addon settings** identical on every
 PC — using the cloud storage you already have (Google Drive, OneDrive,
 Dropbox…). No server, no subscription, no third-party sync service.
